@@ -1523,6 +1523,57 @@ const MAX_ENTER_ATTEMPTS: u32 = 3;
 /// publishing leaves a window where `hcom list` runs after wake, sees an
 /// hours-old status clock, and unlinks a live agent. Keeping both writes in one
 /// place is what stops the paths from drifting apart again.
+/// Minimum interval between routine liveness + endpoint heartbeat writes.
+/// Sized well under `HEARTBEAT_THRESHOLD_TCP` (35s) and 30s sleep-wake detection.
+const LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+struct LivenessThrottle {
+    last_refresh: Option<Instant>,
+    last_ports: Option<(u16, u16)>,
+}
+
+impl LivenessThrottle {
+    fn new() -> Self {
+        Self {
+            last_refresh: None,
+            last_ports: None,
+        }
+    }
+
+    fn refresh_if_due(&mut self, db: &HcomDb, current_name: &str, force: bool) {
+        if force
+            || self
+                .last_refresh
+                .is_none_or(|t| t.elapsed() >= LIVENESS_REFRESH_INTERVAL)
+        {
+            refresh_liveness(db, current_name);
+            self.last_refresh = Some(Instant::now());
+        }
+    }
+
+    fn refresh_all_if_due(
+        &mut self,
+        db: &HcomDb,
+        current_name: &str,
+        notify_port: u16,
+        inject_port: u16,
+        force: bool,
+    ) {
+        let ports = (notify_port, inject_port);
+        if force || self.last_ports != Some(ports) {
+            if let Err(e) = db.refresh_pty_endpoints(current_name, notify_port, inject_port) {
+                log_warn(
+                    "native",
+                    "delivery.register_endpoints_fail",
+                    &format!("{}", e),
+                );
+            }
+            self.last_ports = Some(ports);
+        }
+        self.refresh_if_due(db, current_name, force);
+    }
+}
+
 fn refresh_liveness(db: &HcomDb, current_name: &str) {
     crate::instance_lifecycle::is_in_wake_grace_publishing(db);
     if let Err(e) = db.update_heartbeat(current_name) {
@@ -1713,6 +1764,7 @@ pub fn run_delivery_loop(
         let mut awaiting_ready = false;
         let loop_started = Instant::now();
         let mut was_idle = true;
+        let mut liveness = LivenessThrottle::new();
         let mut stall_since: Option<Instant> = None;
         let mut stall_warned = false;
 
@@ -1830,16 +1882,7 @@ pub fn run_delivery_loop(
             }
 
             // Heartbeat + port re-registration
-            refresh_liveness(db, &current_name);
-            if let Err(e) =
-                db.refresh_pty_endpoints(&current_name, notify.port(), state.inject_port)
-            {
-                log_warn(
-                    "native",
-                    "delivery.register_endpoints_fail",
-                    &format!("{}", e),
-                );
-            }
+            liveness.refresh_all_if_due(db, &current_name, notify.port(), state.inject_port, false);
         }
     } else {
         // Active delivery mode (existing state machine)
@@ -1853,6 +1896,7 @@ pub fn run_delivery_loop(
         let mut submitting_leftover = false;
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
+        let mut liveness = LivenessThrottle::new();
         // Gate block tracking for TUI status updates
         let mut block_since: Option<Instant> = None;
         let mut last_block_context: String = String::new();
@@ -1952,25 +1996,21 @@ pub fn run_delivery_loop(
                     }
 
                     // Detect DB file replacement (hcom reset / schema bump) and reconnect
-                    db.reconnect_if_stale();
+                    let reconnected = db.reconnect_if_stale();
 
                     // A stop + resume may have happened during the wait.
                     if !instance_owns_process_binding(db, &process_id, &current_name) {
                         continue;
                     }
 
-                    // Heartbeat (also re-asserts tcp_mode=true) + wake state.
-                    refresh_liveness(db, &current_name);
-                    // Re-register endpoints (self-heals after DB reset/instance recreation)
-                    if let Err(e) =
-                        db.refresh_pty_endpoints(&current_name, notify.port(), state.inject_port)
-                    {
-                        log_warn(
-                            "native",
-                            "delivery.register_endpoints_fail",
-                            &format!("{}", e),
-                        );
-                    }
+                    // Heartbeat (also re-asserts tcp_mode=true) + wake state + endpoints.
+                    liveness.refresh_all_if_due(
+                        db,
+                        &current_name,
+                        notify.port(),
+                        state.inject_port,
+                        reconnected,
+                    );
 
                     // Check for pending messages
                     let has_pending = db.has_pending(&current_name);
@@ -2097,7 +2137,7 @@ pub fn run_delivery_loop(
                         // waiting (DB status is still "listening" until the message is
                         // delivered and hooks fire). This path can hold for a long time
                         // behind an approval prompt, so it publishes wake state too.
-                        refresh_liveness(db, &current_name);
+                        liveness.refresh_if_due(db, &current_name, false);
 
                         // Log gate failure
                         if attempt == 0 || attempt.is_multiple_of(5) {
@@ -2584,17 +2624,14 @@ pub fn run_delivery_loop(
                         break;
                     }
 
-                    db.reconnect_if_stale();
-                    refresh_liveness(db, &current_name);
-                    if let Err(e) =
-                        db.refresh_pty_endpoints(&current_name, notify.port(), state.inject_port)
-                    {
-                        log_warn(
-                            "native",
-                            "delivery.register_endpoints_fail",
-                            &format!("{}", e),
-                        );
-                    }
+                    let reconnected = db.reconnect_if_stale();
+                    liveness.refresh_all_if_due(
+                        db,
+                        &current_name,
+                        notify.port(),
+                        state.inject_port,
+                        reconnected,
+                    );
 
                     let current_cursor = db.get_cursor(&current_name);
                     let has_pending = db.has_pending(&current_name);

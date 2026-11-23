@@ -38,7 +38,7 @@ pub use instances::InstanceStatus;
 pub use instances::observe_pid_identity;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 20;
+const SCHEMA_VERSION: i32 = 21;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -85,6 +85,27 @@ const MIGRATIONS: &[(i32, &str)] = &[
                json_type(launch_context, '$.terminal_preset_effective') = 'text'
                AND json_extract(launch_context, '$.terminal_preset_effective') != ''
                ELSE 0 END;",
+    ),
+    (
+        21,
+        "DROP INDEX IF EXISTS idx_notify_endpoints_instance;
+         DROP INDEX IF EXISTS idx_notify_endpoints_port;
+         DROP TRIGGER IF EXISTS events_fts_insert;
+         CREATE TRIGGER IF NOT EXISTS events_fts_insert
+         AFTER INSERT ON events
+         WHEN new.type != 'status'
+         BEGIN
+             INSERT INTO events_fts(rowid, searchable) VALUES (
+                 new.id,
+                 COALESCE(json_extract(new.data, '$.text'), '') || ' ' ||
+                 COALESCE(json_extract(new.data, '$.from'), '') || ' ' ||
+                 COALESCE(new.instance, '') || ' ' ||
+                 COALESCE(json_extract(new.data, '$.context'), '') || ' ' ||
+                 COALESCE(json_extract(new.data, '$.detail'), '') || ' ' ||
+                 COALESCE(json_extract(new.data, '$.action'), '') || ' ' ||
+                 COALESCE(json_extract(new.data, '$.reason'), '')
+             );
+         END;",
     ),
 ];
 
@@ -160,7 +181,7 @@ impl HcomDb {
         // load) fails instantly with SQLITE_BUSY. Setting the timeout up front
         // makes the WAL conversion retry instead.
         conn.execute_batch(
-            "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
+            "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA journal_size_limit=8388608;",
         )?;
 
         Ok(conn)
@@ -271,7 +292,7 @@ impl HcomDb {
         match Connection::open(&self.db_path) {
             Ok(new_conn) => {
                 if let Err(e) = new_conn.execute_batch(
-                    "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
+                    "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA journal_size_limit=8388608;",
                 ) {
                     use crate::log::log_warn;
                     log_warn(
@@ -342,8 +363,6 @@ impl HcomDb {
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (instance, kind)
             );
-            CREATE INDEX IF NOT EXISTS idx_notify_endpoints_instance ON notify_endpoints(instance);
-            CREATE INDEX IF NOT EXISTS idx_notify_endpoints_port ON notify_endpoints(port);
 
             -- Process bindings
             CREATE TABLE IF NOT EXISTS process_bindings (
@@ -472,7 +491,9 @@ impl HcomDb {
                 tokenize='unicode61'
             );
             CREATE TRIGGER IF NOT EXISTS events_fts_insert
-            AFTER INSERT ON events BEGIN
+            AFTER INSERT ON events
+            WHEN new.type != 'status'
+            BEGIN
                 INSERT INTO events_fts(rowid, searchable) VALUES (
                     new.id,
                     COALESCE(json_extract(new.data, '$.text'), '') || ' ' ||
@@ -1404,6 +1425,30 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_init_db_fts_trigger_skips_status_events() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES ('2026-01-01T00:00:00Z', 'status', 'luna', ?)",
+                params![serde_json::json!({"status": "active", "context": "tool:bash", "detail": "unindexedtoken"}).to_string()],
+            )
+            .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_fts WHERE searchable MATCH 'unindexedtoken'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
 
         cleanup_test_db(db_path);
     }
