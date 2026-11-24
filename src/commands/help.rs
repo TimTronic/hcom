@@ -541,6 +541,7 @@ const LISTEN_HELP: &[HelpEntry] = &[
     ("  [timeout]", "Timeout in seconds (alias for --timeout)"),
     ("  --timeout N", "Timeout in seconds (default: 86400)"),
     ("  --json", "Output messages as JSON"),
+    ("  --peek", "Wake on a pending message and leave it unread"),
     ("", ""),
     ("Filter flags:", ""),
     ("", "Supports all filter flags from 'events' command"),

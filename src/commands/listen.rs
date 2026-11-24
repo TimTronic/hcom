@@ -32,6 +32,9 @@ pub struct ListenArgs {
     /// JSON output
     #[arg(long)]
     pub json: bool,
+    /// Wake when a message is waiting without delivering it or marking it read
+    #[arg(long)]
+    pub peek: bool,
     /// SQL WHERE filter
     #[arg(long)]
     pub sql: Option<String>,
@@ -148,10 +151,29 @@ fn expand_sql_preset(sql: &str) -> Result<String, &'static str> {
     ))
 }
 
+#[cfg(unix)]
+fn is_null_device(fd: impl std::os::fd::AsFd) -> bool {
+    use nix::sys::stat::{fstat, stat};
+    matches!(
+        (fstat(fd), stat("/dev/null")),
+        (Ok(output), Ok(null)) if output.st_dev == null.st_dev && output.st_ino == null.st_ino
+    )
+}
+
 /// Main entry point for `hcom listen` command.
 ///
 /// Returns exit code (0 = success, 1 = error, 130 = interrupted).
 pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) -> i32 {
+    #[cfg(unix)]
+    let discarding_output = is_null_device(std::io::stdout());
+    #[cfg(not(unix))]
+    let discarding_output = false;
+    let peek = args.peek || discarding_output;
+    if peek {
+        // The router can otherwise deliver to ad-hoc agents after the command
+        // returns, including when a message arrives just before a timeout.
+        crate::cli_context::claim_inline_delivery();
+    }
     let explicit_name = ctx.and_then(|c| c.explicit_name.as_deref());
 
     // Resolve identity
@@ -253,6 +275,10 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
 
     // Branch: SQL filter mode (combined from flags + --sql)
     if let Some(ref filter) = combined_sql {
+        if args.peek {
+            eprintln!("Error: --peek is only available when waiting for messages");
+            return 1;
+        }
         // Setup SIGTERM handler for filter mode
         let shutdown = Arc::new(AtomicBool::new(false));
         crate::sys::signal::register_term(&shutdown);
@@ -308,6 +334,7 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         &instance_name,
         timeout,
         json_output,
+        peek,
         instance_data.unwrap(),
         start_time,
         notify_server.as_ref(),
@@ -326,6 +353,7 @@ fn listen_loop(
     instance_name: &str,
     timeout: f64,
     json_output: bool,
+    peek: bool,
     instance_data: &serde_json::Value,
     start_time: std::time::Instant,
     notify_server: Option<&NotifyServer>,
@@ -352,6 +380,13 @@ fn listen_loop(
 
         // Check for unread messages
         if let Some(batch) = InlineBatch::take(db, instance_name) {
+            if peek {
+                if !json_output {
+                    eprintln!("[Message waiting; left unread]");
+                }
+                set_listen_done_status(db, instance_name, instance_data, "message pending");
+                return 0;
+            }
             // listen delivers this batch itself (or leaves it unread on a failed
             // write); the router must not deliver another one after it.
             crate::cli_context::claim_inline_delivery();
@@ -802,6 +837,46 @@ mod tests {
             go: false,
             identity_warning: None,
         }
+    }
+
+    #[test]
+    #[serial]
+    fn peek_leaves_the_delivery_cursor_for_a_later_read() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tool) VALUES ('luna', 1000.0, 'adhoc')",
+                [],
+            )
+            .unwrap();
+        let id = db
+            .log_event(
+                "message",
+                "nova",
+                &serde_json::json!({"from": "nova", "text": "still waiting", "delivered_to": ["luna"]}),
+            )
+            .unwrap();
+        let before = row(&db).last_event_id;
+        assert_eq!(
+            cmd_listen(&db, &listen_args(&["--peek", "1"]), Some(&ctx("luna"))),
+            0
+        );
+        assert_eq!(row(&db).last_event_id, before);
+        assert_eq!(db.get_unread_messages("luna")[0].event_id, Some(id));
+        assert_eq!(cmd_listen(&db, &listen_args(&["1"]), Some(&ctx("luna"))), 0);
+        assert_eq!(row(&db).last_event_id, id);
+        assert!(db.get_unread_messages("luna").is_empty());
+        cleanup_test_db(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn null_device_detection_distinguishes_normal_redirection() {
+        use std::fs::{File, OpenOptions};
+        let null = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let file: File = tempfile::tempfile().unwrap();
+        assert!(is_null_device(&null));
+        assert!(!is_null_device(&file));
     }
 
     fn backdate_status(db: &HcomDb, secs: i64) {

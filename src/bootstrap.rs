@@ -123,7 +123,7 @@ User says 'the pi/claude/codex agent' or unclear → run `hcom list` to resolve 
 
 This is session context, not a task for immediate action. hcom does not replace native subagents."#;
 
-const LISTEN_OUTPUT_NOTICE: &str = "Never truncate/hide hcom listen output.";
+const LISTEN_OUTPUT_NOTICE: &str = "Read plain hcom listen output fully. Use hcom listen --peek to wait without consuming messages.";
 const HANDOFF_RESULT: &str = " → <hcom> sends you result when done";
 pub(crate) const HANDOFF_SUFFIX: &str =
     "When done, send your result back to @{launcher_name} via hcom.";
@@ -210,8 +210,7 @@ Messages instantly and automatically arrive via <hcom> tags — end your turn to
 
 ## WAITING RULES
 
-1. Never use `sleep [sec]` instead use `hcom listen [sec]` (returns early when msg arrives)
-2. Only use `hcom listen` when you are waiting for something not related to hcom and were going to use `sleep`
+- For a non-hcom pause, use `hcom listen --peek [sec]`. It returns early when a message arrives and leaves it unread for hook delivery.
 - Waiting for hcom message → end your turn
 - Waiting for agent progress → `hcom events sub`, end your turn"#;
 
@@ -220,7 +219,7 @@ const DELIVERY_ADHOC: &str = r#"## DELIVERY
 Messages do NOT arrive automatically.
 - Check messages: `hcom listen 1`
 - Wait for messages: `hcom listen [timeout]`
-- Always substitute `sleep [timeout]` with `hcom listen [timeout]`
+- For a non-hcom pause, use `hcom listen --peek [timeout]`. Read any pending messages with plain `hcom listen` afterward.
 
 <critical_rule>
 LISTENING REQUIREMENT:
@@ -263,7 +262,7 @@ You're participating in the hcom multi-agent network.
 Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
 
 - For hcom message waiting: end your turn (do not run `hcom listen`).
-- For non-hcom pause/yield, use `hcom listen` instead of `sleep`.
+- For a non-hcom pause, use `hcom listen --peek [sec]` so messages stay unread for hook delivery.
 
 Response rules:
 - From {SENDER} or intent=request → always respond
